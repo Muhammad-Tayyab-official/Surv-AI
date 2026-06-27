@@ -3,3 +3,5 @@ timestamp,vendor_id,original_prediction,actual_outcome,months_since_prediction
 2026-06-23 15:03:16,USER_20260623_150012,2.5,Survived,unknown
 2026-06-23 15:05:45,USER_20260623_150512,97.5,Survived,unknown
 2026-06-23 15:05:53,USER_20260623_150512,97.5,Survived,unknown
+2026-06-27 13:44:02,USER_20260627134326,2.5,Failed,unknown
+2026-06-27 13:47:35,USER_20260627134709,97.5,Survived,unknown

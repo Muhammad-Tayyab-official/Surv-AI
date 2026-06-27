@@ -1,411 +1,501 @@
 """
 model.py
-Refined Bayesian Survival Predictor — numerically stable, research-grounded.
+SurvAI — Bayesian Survival Predictor
 
-Key fixes vs. previous version:
-  1. predict() now uses log-space computation (log-sum-exp trick) to avoid
-     floating-point underflow that caused the '100% probability' bug when
-     multiplying 15 small likelihood values together directly.
-  2. get_question_stats() fixed: was referencing self.q_cols (undefined),
-     now correctly uses self.question_columns.
-  3. Hidden business-age modifier: inferred from Q1 (supplier relationship depth,
-     a proxy for how long the business has been running) combined with Q3
-     (location stability). Applied as a ±15% calibration multiplier to the
-     raw Bayes posterior before final clipping.
-  4. Prior updated to 0.33 (research-backed: Eurasian SME study 63% fail at 18
-     months, World Bank / Uganda startup data).
+STATISTICS CONCEPTS USED IN THIS FILE:
+  ┌─────────────────────────────────────────────────────────────┐
+  │ 1. Prior Probability   — P(Survived) = 0.30 (fixed anchor) │
+  │ 2. Conditional Prob    — P(answer | outcome)               │
+  │ 3. Multiplicative Rule — multiply likelihoods across Qs   │
+  │ 4. Bayes' Theorem      — update prior with evidence        │
+  │ 5. Law of Total Prob   — P(ans) = P(ans|S)P(S)+P(ans|F)P(F)│
+  │ 6. Confidence Interval — Wilson Score 95% CI              │
+  │ 7. Contingency Table   — chi-squared independence test     │
+  │ 8. Binomial Distribution — calibration check              │
+  └─────────────────────────────────────────────────────────────┘
+
+HOW THE PREDICTION WORKS (plain English):
+  1. Start with P(Survived) = 30% — the "base rate" before seeing anything.
+  2. For each of the 15 questions, ask:
+       "How much more (or less) likely is this answer among survivors
+        compared to failures?"
+  3. Multiply all 15 likelihood ratios together with the prior.
+  4. Normalise to get a final probability between 0% and 100%.
+
+  This is exactly Bayes' Theorem applied 15 times in a row.
 """
 
-import pandas as pd
-import numpy as np
 import json
 import os
+import numpy as np
+import pandas as pd
 from datetime import datetime
+from scipy.stats import chi2_contingency
 
 
 class SurvivalPredictor:
+    """
+    Naive Bayes classifier for micro-business survival prediction.
 
-    def __init__(self, model_path='model/bayesian_model.json'):
-        self.model_path = model_path
-        # 15 indicator columns: ['q1', 'q2', ..., 'q15']
-        self.question_columns = [f'q{i}' for i in range(1, 16)]
+    "Naive" because it assumes all 15 questions are INDEPENDENT —
+    i.e. knowing the answer to Q1 tells us nothing extra about Q2.
+    This is almost never perfectly true, but it works surprisingly
+    well in practice and keeps the maths very simple.
+    """
+
+    # ── Fixed research prior ─────────────────────────────────────
+    # These NEVER change — they are our "starting belief" before
+    # seeing any vendor's answers, grounded in real-world studies.
+    PRIOR_SURVIVED = 0.30
+    PRIOR_FAILED   = 0.70
+    # ─────────────────────────────────────────────────────────────
+
+    def __init__(self, model_path="model/bayesian_model.json"):
+        self.model_path       = model_path
+        self.question_columns = [f"q{i}" for i in range(1, 16)]
 
         if os.path.exists(model_path):
             self.load_model()
         else:
             self.train_model()
 
-    # ------------------------------------------------------------------
+    # ─────────────────────────────────────────────────────────────
     def load_model(self):
-        """Loads pre-calculated parameters from the JSON model file."""
-        with open(self.model_path, 'r') as fh:
+        """Read pre-trained parameters from JSON."""
+        with open(self.model_path, "r") as fh:
             self.model = json.load(fh)
 
-    # ------------------------------------------------------------------
+    # ─────────────────────────────────────────────────────────────
     def train_model(self):
         """
-        Trains the Bayesian engine by blending baseline mock data with
-        real verified user data.  Uses Laplace smoothing (+1) to prevent
-        zero-probability issues.
+        Learn P(answer | outcome) from data.
+
+        STATISTICS CONCEPT — Laplace Smoothing:
+          Without smoothing, if no failed vendor ever gave answer=3
+          to some question, P(answer=3 | Failed) = 0/total = 0.
+          Then the product of all 15 likelihoods would be 0 no matter
+          what the other 14 answers say — a ridiculous result.
+          Adding 1 to every count (Laplace smoothing) prevents this.
         """
-        mock_data_path = 'data/mock_data.csv'
-        user_data_path = 'data/user_responses.csv'
+        df = pd.read_csv("data/mock_data.csv")
 
-        df_mock = pd.read_csv(mock_data_path)
+        # Merge in any real users who have a verified outcome
+        user_path = "data/user_responses.csv"
+        if os.path.exists(user_path):
+            df_user = pd.read_csv(user_path)
+            verified = df_user[df_user["survival_outcome"].isin(["Survived", "Failed"])]
+            if len(verified) > 0:
+                shared = [c for c in df.columns if c in verified.columns]
+                df = pd.concat([df, verified[shared]], ignore_index=True)
 
-        # Safely join real user data if available and has verified outcomes
-        df = df_mock.copy()
-        if os.path.exists(user_data_path):
-            df_user = pd.read_csv(user_data_path)
-            if len(df_user) > 0:
-                df_user_verified = df_user[df_user['survival_outcome'].notna()]
-                if len(df_user_verified) > 0:
-                    # Only keep columns that exist in mock data
-                    shared_cols = [c for c in df_mock.columns if c in df_user_verified.columns]
-                    df = pd.concat([df_mock, df_user_verified[shared_cols]], ignore_index=True)
+        survived = df[df["survival_outcome"] == "Survived"]
+        failed   = df[df["survival_outcome"] == "Failed"]
+        n_s, n_f = len(survived), len(failed)
 
-        survived_group = df[df['survival_outcome'] == 'Survived']
-        failed_group   = df[df['survival_outcome'] == 'Failed']
+        LAPLACE   = 1
+        N_CHOICES = 3
 
-        total_records  = len(df)
-        count_survived = len(survived_group)
-        count_failed   = len(failed_group)
+        likelihood_table  = {}
+        conditional_table = {}
 
-        prior_survived = count_survived / total_records if total_records > 0 else 0.33
-        prior_failed   = count_failed   / total_records if total_records > 0 else 0.67
+        for q in self.question_columns:
+            s_cnt = survived[q].value_counts().reindex([1, 2, 3], fill_value=0)
+            f_cnt = failed[q].value_counts().reindex([1, 2, 3], fill_value=0)
 
-        laplace_alpha        = 1
-        possible_answers_count = 3  # answers are always 1, 2, or 3
+            likelihood_table[q]  = {}
+            conditional_table[q] = {}
 
-        likelihood_dictionary = {}
-        for q_name in self.question_columns:
-            likelihood_dictionary[q_name] = {}
+            for ans in [1, 2, 3]:
+                a = str(ans)
+                # ── Multiplicative Rule setup ──────────────────────
+                # These are P(answer | class) — the building blocks
+                # we will MULTIPLY together inside predict()
+                p_s = (s_cnt[ans] + LAPLACE) / (n_s + LAPLACE * N_CHOICES)
+                p_f = (f_cnt[ans] + LAPLACE) / (n_f + LAPLACE * N_CHOICES)
 
-            survived_counts = survived_group[q_name].value_counts().reindex([1, 2, 3], fill_value=0)
-            failed_counts   = failed_group[q_name].value_counts().reindex([1, 2, 3], fill_value=0)
-
-            for answer_choice in [1, 2, 3]:
-                ans_str = str(answer_choice)
-
-                p_given_s = float(
-                    (survived_counts[answer_choice] + laplace_alpha) /
-                    (count_survived + laplace_alpha * possible_answers_count)
-                )
-                p_given_f = float(
-                    (failed_counts[answer_choice] + laplace_alpha) /
-                    (count_failed + laplace_alpha * possible_answers_count)
-                )
-
-                likelihood_dictionary[q_name][ans_str] = {
-                    'P_given_Survived': p_given_s,
-                    'P_given_Failed':   p_given_f
+                likelihood_table[q][a] = {
+                    "P_given_Survived": round(float(p_s), 6),
+                    "P_given_Failed":   round(float(p_f), 6),
                 }
 
-        # Empirical conditional P(Survived | answer)  — for analytics views
-        conditional_dictionary = {}
-        for q_name in self.question_columns:
-            conditional_dictionary[q_name] = {}
-            for answer_choice in [1, 2, 3]:
-                ans_str       = str(answer_choice)
-                total_w_ans   = (df[q_name] == answer_choice).sum()
-                surv_w_ans    = ((df[q_name] == answer_choice) &
-                                 (df['survival_outcome'] == 'Survived')).sum()
-                if total_w_ans > 0:
-                    cond_p = (surv_w_ans + laplace_alpha) / (total_w_ans + laplace_alpha * 2)
-                else:
-                    cond_p = prior_survived
-                conditional_dictionary[q_name][ans_str] = float(cond_p)
+                # ── Conditional Probability ────────────────────────
+                # P(Survived | answer=k) — direct empirical fraction
+                # Used only for the analytics heatmap display
+                n_with_ans = (df[q] == ans).sum()
+                n_surv_ans = ((df[q] == ans) & (df["survival_outcome"] == "Survived")).sum()
+                cond_p = (n_surv_ans / n_with_ans) if n_with_ans > 0 else self.PRIOR_SURVIVED
+                conditional_table[q][a] = round(float(cond_p), 6)
+
+        n_mock = int((df["data_source"] == "mock").sum()) if "data_source" in df.columns else len(df)
+        n_real = int((df["data_source"] == "real").sum()) if "data_source" in df.columns else 0
 
         self.model = {
-            'prior_survived':  prior_survived,
-            'prior_failed':    prior_failed,
-            'likelihood':      likelihood_dictionary,
-            'conditional':     conditional_dictionary,
-            'n_total':         total_records,
-            'n_survived':      int(count_survived),
-            'n_failed':        int(count_failed),
-            'n_mock':          int((df['data_source'] == 'mock').sum())
-                               if 'data_source' in df.columns else total_records,
-            'n_real':          int((df['data_source'] == 'real').sum())
-                               if 'data_source' in df.columns else 0,
-            'last_trained':    datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            "prior_survived":    self.PRIOR_SURVIVED,
+            "prior_failed":      self.PRIOR_FAILED,
+            "empirical_prior_s": round(n_s / len(df), 6),
+            "empirical_prior_f": round(n_f / len(df), 6),
+            "likelihood":        likelihood_table,
+            "conditional":       conditional_table,
+            "n_total":           len(df),
+            "n_survived":        int(n_s),
+            "n_failed":          int(n_f),
+            "n_mock":            n_mock,
+            "n_real":            n_real,
+            "last_trained":      datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
 
-        os.makedirs('model', exist_ok=True)
-        with open(self.model_path, 'w') as fh:
+        os.makedirs("model", exist_ok=True)
+        with open(self.model_path, "w") as fh:
             json.dump(self.model, fh, indent=2)
 
         return self.model
 
-    # ------------------------------------------------------------------
+    # ─────────────────────────────────────────────────────────────
     def _business_age_modifier(self, answers):
         """
-        Infers an approximate business maturity signal from two proxy questions
-        and returns a calibration multiplier applied to the raw Bayes posterior.
+        Small odds adjustment based on inferred business maturity.
+        Q1 (supplier duration) × Q3 (location stability) act as
+        a proxy for how long the business has been running.
 
-        Q1 (supplier relationship duration) is the best proxy for business age:
-          - Score 3 (>12 months supplier) → established business
-          - Score 1 (<3 months supplier)  → very new or struggling business
-
-        Q3 (location stability) reinforces the signal:
-          - Score 3 (fixed location)  → stable, likely longer-running
-          - Score 1 (mobile / roving) → early-stage or vulnerable
-
-        Combinations and their multipliers (applied to odds, not probability):
-          Q1=3 & Q3=3  → +15% odds multiplier  (mature, settled)
-          Q1=3 & Q3=2  → +10% odds multiplier  (established supplier, semi-fixed)
-          Q1=2 & Q3=3  → +07% odds multiplier  (medium tenure, fixed location)
-          Q1=1 & Q3=1  → -10% odds multiplier  (brand new, roving — highest risk)
-          Q1=1 & Q3=2  → -05% odds multiplier  (new, somewhat mobile)
-          All others   → 1.00 (neutral, no adjustment)
-
-        The multiplier is applied to the survival odds (p / (1-p)) rather than
-        the raw probability, which keeps the adjustment proportional and bounded.
+        Returns a multiplier applied in odds-space:
+          odds_new = odds_old × modifier
+        So 1.15 boosts the survival odds by 15%.
         """
-        q1 = answers.get('q1', 2)
-        q3 = answers.get('q3', 2)
+        q1 = answers.get("q1", 2)
+        q3 = answers.get("q3", 2)
+        if   q1 == 3 and q3 == 3: return 1.15
+        elif q1 == 3 and q3 == 2: return 1.10
+        elif q1 == 2 and q3 == 3: return 1.07
+        elif q1 == 1 and q3 == 1: return 0.85
+        elif q1 == 1 and q3 == 2: return 0.90
+        else:                     return 1.00
 
-        if   q1 == 3 and q3 == 3:
-            return 1.15
-        elif q1 == 3 and q3 == 2:
-            return 1.10
-        elif q1 == 2 and q3 == 3:
-            return 1.07
-        elif q1 == 1 and q3 == 1:
-            return 0.90
-        elif q1 == 1 and q3 == 2:
-            return 0.95
-        else:
-            return 1.00
-
-    # ------------------------------------------------------------------
+    # ─────────────────────────────────────────────────────────────
     def predict(self, answers):
         """
-        Computes the Bayesian posterior P(Survived | all 15 answers).
+        Compute P(Survived | all 15 answers) using Bayes' Theorem.
 
-        Uses LOG-SPACE arithmetic throughout to prevent floating-point underflow.
-        With 15 likelihood multiplications, direct products of values like 0.05
-        raised to the 15th power underflow to 0.0 in float64, causing the
-        denominator to collapse and the result to pin at 0% or 100%.
+        ── BAYES' THEOREM (the heart of the model) ──────────────
+        P(S | Q1,Q2,...,Q15)
+          ∝ P(S) × P(Q1|S) × P(Q2|S) × ... × P(Q15|S)
 
-        Log-sum-exp pattern:
-          log P(S | X) ∝ log P(S) + Σ log P(xᵢ | S)
-          log P(F | X) ∝ log P(F) + Σ log P(xᵢ | F)
-          posterior = 1 / (1 + exp(log_score_F - log_score_S))
+        P(F | Q1,Q2,...,Q15)
+          ∝ P(F) × P(Q1|F) × P(Q2|F) × ... × P(Q15|F)
 
-        A hidden business-age modifier (inferred from Q1 × Q3 proxy) is applied
-        to the survival odds after the main Bayes step.
+        Then normalise:
+          posterior = numerator_S / (numerator_S + numerator_F)
+
+        ── MULTIPLICATIVE RULE ───────────────────────────────────
+        Because we assume questions are independent (Naive Bayes),
+        we can MULTIPLY likelihoods: P(Q1,Q2|S) = P(Q1|S)×P(Q2|S)
+
+        ── WHY LOG SPACE? ────────────────────────────────────────
+        Multiplying 15 small numbers like 0.05 × 0.08 × 0.12 ...
+        can produce numbers so tiny that computers round them to 0
+        (floating-point underflow). Taking log turns multiplication
+        into addition: log(a×b) = log(a) + log(b). Then we use
+        the log-sum-exp trick to convert back safely.
         """
-        log_score_s = np.log(self.model['prior_survived'])
-        log_score_f = np.log(self.model['prior_failed'])
+        # Start with the log of our prior
+        log_s = np.log(self.model["prior_survived"])   # log(0.30)
+        log_f = np.log(self.model["prior_failed"])     # log(0.70)
+
         question_impact = {}
 
-        # Step 1: Accumulate log-likelihoods for all 15 questions
-        for q_name in self.question_columns:
-            selected_answer = str(answers.get(q_name, 2))
+        for q in self.question_columns:
+            ans = str(answers.get(q, 2))
+            p_s = max(self.model["likelihood"][q][ans]["P_given_Survived"], 1e-9)
+            p_f = max(self.model["likelihood"][q][ans]["P_given_Failed"],   1e-9)
 
-            p_s = self.model['likelihood'][q_name][selected_answer]['P_given_Survived']
-            p_f = self.model['likelihood'][q_name][selected_answer]['P_given_Failed']
+            # Accumulate log-likelihoods (Multiplicative Rule in log-space)
+            log_s += np.log(p_s)
+            log_f += np.log(p_f)
 
-            # Guard against zero likelihoods (Laplace smoothing should prevent this,
-            # but we add a floor just in case of manually loaded edge-case models)
-            p_s = max(p_s, 1e-9)
-            p_f = max(p_f, 1e-9)
+            # Likelihood ratio: how much does this answer shift the odds?
+            question_impact[q] = round(p_s / p_f, 4)
 
-            log_score_s += np.log(p_s)
-            log_score_f += np.log(p_f)
+        # Convert back from log-space: P = 1 / (1 + exp(log_f - log_s))
+        # This is the numerically stable form of Bayes normalisation
+        posterior = 1.0 / (1.0 + np.exp(log_f - log_s))
 
-            # Impact ratio: how much does this answer favour survival vs failure?
-            question_impact[q_name] = round(p_s / p_f, 4)
+        # Apply business-age odds modifier
+        modifier = self._business_age_modifier(answers)
+        if modifier != 1.0:
+            odds = posterior / (1.0 - posterior + 1e-12)
+            posterior = (odds * modifier) / (1.0 + odds * modifier)
 
-        # Step 2: Numerically stable conversion back to probability
-        # posterior_s = exp(log_s) / (exp(log_s) + exp(log_f))
-        #             = 1 / (1 + exp(log_f - log_s))   ← log-sum-exp trick
-        log_diff = log_score_f - log_score_s
-        posterior_probability = 1.0 / (1.0 + np.exp(log_diff))
+        # Clamp to [2.5%, 97.5%] — we never want to say "definitely 0% or 100%"
+        posterior = float(np.clip(posterior, 0.025, 0.975))
+        prob_pct  = round(posterior * 100, 1)
 
-        # Step 3: Apply hidden business-age modifier (odds-space multiplication)
-        age_modifier = self._business_age_modifier(answers)
-        if age_modifier != 1.0:
-            # Convert to odds, scale, convert back
-            raw_odds  = posterior_probability / (1.0 - posterior_probability + 1e-12)
-            adj_odds  = raw_odds * age_modifier
-            posterior_probability = adj_odds / (1.0 + adj_odds)
+        # ── CONFIDENCE INTERVAL (Wilson Score method) ─────────────
+        # The Wilson Score CI is more accurate than the simple
+        # ±1.96×sqrt(p(1-p)/n) formula, especially near 0 or 1.
+        #
+        # CONCEPT: A 95% CI means if we repeated this assessment
+        # many times with similar vendors, 95% of those intervals
+        # would contain the true survival probability.
+        n   = max(self.model["n_total"], 30)
+        z   = 1.96   # 95% confidence → z = 1.96 standard deviations
+        p   = posterior
+        den = 1 + z**2 / n
+        ctr = (p + z**2 / (2*n)) / den
+        mrg = (z * np.sqrt(p*(1-p)/n + z**2/(4*n**2))) / den
+        ci_lower = round(max(0.0,   (ctr - mrg) * 100), 1)
+        ci_upper = round(min(100.0, (ctr + mrg) * 100), 1)
 
-        # Step 4: Clip to a realistic range — no prediction should be
-        # literally 0% or 100% given only 15 observable indicators.
-        posterior_probability = float(np.clip(posterior_probability, 0.025, 0.975))
-        posterior_percentage  = round(posterior_probability * 100, 1)
+        # Risk category thresholds
+        if   prob_pct >= 60: category, color = "Low Risk",    "#2F6B4F"
+        elif prob_pct >= 35: category, color = "Medium Risk", "#C9622D"
+        else:                category, color = "High Risk",   "#A23B3B"
 
-        # Step 5: Wilson Score Confidence Interval (95%)
-        prior_s           = self.model['prior_survived']
-        sample_size       = max(self.model['n_total'], 30)
-        z                 = 1.96
-        denom             = 1 + (z ** 2) / sample_size
-        centre            = (posterior_probability + (z ** 2) / (2 * sample_size)) / denom
-        margin            = (z * np.sqrt(
-                                 posterior_probability * (1 - posterior_probability) / sample_size +
-                                 (z ** 2) / (4 * sample_size ** 2)
-                             )) / denom
-        ci_lower = round(max(0.0,   (centre - margin) * 100), 1)
-        ci_upper = round(min(100.0, (centre + margin) * 100), 1)
+        # Identify top 3 strengths (high likelihood ratio) and weaknesses (low ratio)
+        ranked     = sorted(question_impact.items(), key=lambda x: x[1], reverse=True)
+        strengths  = [q for q, v in ranked[:3]  if v > 1.2]
+        weaknesses = [q for q, v in ranked[-3:] if v < 0.8]
 
-        # Step 6: Risk category
-        if   posterior_percentage >= 60.0:
-            category, color = "Low Risk",    "#2F6B4F"
-        elif posterior_percentage >= 35.0:
-            category, color = "Medium Risk", "#C9622D"
-        else:
-            category, color = "High Risk",   "#A23B3B"
-
-        # Step 7: Top 3 strengths and weaknesses
-        sorted_impacts = sorted(question_impact.items(), key=lambda x: x[1], reverse=True)
-        strengths      = [q for q, v in sorted_impacts[:3]  if v > 1.0]
-        weaknesses     = [q for q, v in sorted_impacts[-3:] if v < 1.0]
-
-        advice_map = {
-            "Low Risk":    "Your business shows strong resilience indicators. The pattern favours you.",
-            "Medium Risk": "Your business has potential but faces real challenges.",
-            "High Risk":   "Your business sits in a vulnerable position. Address weak spots first."
-        }
+        prior_pct = round(self.model["prior_survived"] * 100, 1)
 
         return {
-            'probability':      posterior_percentage,
-            'ci_lower':         ci_lower,
-            'ci_upper':         ci_upper,
-            'prior':            round(prior_s * 100, 1),
-            'change':           round((posterior_probability - prior_s) * 100, 1),
-            'category':         category,
-            'color':            color,
-            'advice':           advice_map[category],
-            'strengths':        strengths,
-            'weaknesses':       weaknesses,
-            'question_impact':  question_impact,
-            'total_score':      sum(answers.values()),
-            'age_modifier':     age_modifier,
-            'model_info': {
-                'trained_on':   self.model['n_total'],
-                'mock':         self.model.get('n_mock', 0),
-                'real':         self.model.get('n_real', 0),
-                'last_trained': self.model.get('last_trained', 'Unknown')
-            }
+            "probability":     prob_pct,
+            "ci_lower":        ci_lower,
+            "ci_upper":        ci_upper,
+            "prior":           prior_pct,
+            "change":          round((posterior - self.model["prior_survived"]) * 100, 1),
+            "category":        category,
+            "color":           color,
+            "strengths":       strengths,
+            "weaknesses":      weaknesses,
+            "question_impact": question_impact,
+            "total_score":     sum(answers.values()),
+            "age_modifier":    modifier,
         }
 
-    # ------------------------------------------------------------------
+    # ─────────────────────────────────────────────────────────────
     def get_question_stats(self):
         """
-        Calculates the predictive gap between the best and worst answer
-        for each question, using the empirical conditional probability table.
-        Fixed: was referencing self.q_cols (undefined); now uses self.question_columns.
+        For each question, compute the "predictive gap":
+          gap = P(Survived | strong answer) − P(Survived | weak answer)
+
+        A bigger gap means the question separates survivors from
+        failures more cleanly — it is more important.
+
+        CONCEPT: This is a measure of the question's discriminatory
+        power, related to the concept of EFFECT SIZE.
         """
-        gaps_list = []
-        for q_name in self.question_columns:   # ← fixed from self.q_cols
-            high_score = self.model['conditional'][q_name].get('3', 0.0)
-            low_score  = self.model['conditional'][q_name].get('1', 0.0)
-            mid_score  = self.model['conditional'][q_name].get('2', 0.0)
-            gaps_list.append({
-                'question':              q_name,
-                'P_Survived_given_High': round(high_score * 100, 1),
-                'P_Survived_given_Mid':  round(mid_score  * 100, 1),
-                'P_Survived_given_Low':  round(low_score  * 100, 1),
-                'gap':                   round((high_score - low_score) * 100, 1)
+        results = []
+        for q in self.question_columns:
+            high = self.model["conditional"][q].get("3", 0.0)
+            mid  = self.model["conditional"][q].get("2", 0.0)
+            low  = self.model["conditional"][q].get("1", 0.0)
+            results.append({
+                "question":              q,
+                "P_Survived_given_High": round(high * 100, 1),
+                "P_Survived_given_Mid":  round(mid  * 100, 1),
+                "P_Survived_given_Low":  round(low  * 100, 1),
+                "gap":                   round((high - low) * 100, 1),
             })
-        return sorted(gaps_list, key=lambda e: e['gap'], reverse=True)
+        return sorted(results, key=lambda x: x["gap"], reverse=True)
+
+    # ─────────────────────────────────────────────────────────────
+    def check_independence(self):
+        """
+        STATISTICS CONCEPT — Contingency Table & Chi-Squared Test:
+
+        A contingency table counts how often two categorical variables
+        appear together. For example:
+               Q1=1  Q1=2  Q1=3
+        Q6=1  [ 10    5    2 ]
+        Q6=2  [  3   20    8 ]
+        Q6=3  [  1    4   30 ]
+
+        The chi-squared test asks: "Is this pattern too structured
+        to be random?" If p < 0.01, we say Q1 and Q6 are NOT
+        independent — knowing Q1 gives information about Q6.
+
+        Naive Bayes ASSUMES independence, so violations here are
+        documented limitations, not bugs.
+        """
+        df = pd.read_csv("data/mock_data.csv")
+        user_path = "data/user_responses.csv"
+        if os.path.exists(user_path):
+            df_u = pd.read_csv(user_path)
+            if len(df_u) > 0:
+                shared = [c for c in df.columns if c in df_u.columns]
+                df = pd.concat([df, df_u[shared]], ignore_index=True)
+
+        violations = []
+        for i, q1 in enumerate(self.question_columns):
+            for q2 in self.question_columns[i+1:]:
+                try:
+                    table = pd.crosstab(df[q1], df[q2])
+                    chi2, p_val, dof, _ = chi2_contingency(table)
+                    if p_val < 0.01:
+                        violations.append({
+                            "pair":      f"{q1} × {q2}",
+                            "chi2":      round(chi2, 2),
+                            "p_value":   round(p_val, 6),
+                            "violation": "SIGNIFICANT" if p_val < 0.001 else "MODERATE",
+                        })
+                except Exception:
+                    pass
+        return sorted(violations, key=lambda x: x["p_value"])
+
+    # ─────────────────────────────────────────────────────────────
+    def check_calibration(self):
+        """
+        STATISTICS CONCEPT — Calibration & Binomial Distribution:
+
+        Calibration asks: "When the model says 60% survival chance,
+        do about 60% of those vendors actually survive?"
+
+        We simplify this to a classification accuracy check:
+          - Predicted Low Risk (≥35%) + actually Survived = correct
+          - Predicted High Risk (<60%) + actually Failed   = correct
+
+        BINOMIAL DISTRIBUTION connection:
+        If our model is perfectly calibrated (true accuracy = 70%),
+        then the number of correct predictions out of N follows a
+        Binomial(N, 0.70) distribution.
+        """
+        user_path = "data/user_responses.csv"
+        if not os.path.exists(user_path):
+            return None
+
+        df = pd.read_csv(user_path)
+        df = df[df["survival_outcome"].isin(["Survived", "Failed"])]
+
+        if len(df) < 10:
+            return {
+                "status":  "insufficient_data",
+                "message": f"Need ≥10 verified outcomes (have {len(df)})",
+            }
+
+        correct = 0
+        total   = 0
+        for _, row in df.iterrows():
+            try:
+                answers = {q: int(row[q]) for q in self.question_columns
+                           if q in row and pd.notna(row[q])}
+                if len(answers) < 15:
+                    continue
+                result = self.predict(answers)
+                actual = row["survival_outcome"]
+                if actual == "Survived" and result["probability"] >= 35:
+                    correct += 1
+                elif actual == "Failed" and result["probability"] < 60:
+                    correct += 1
+                total += 1
+            except Exception:
+                continue
+
+        if total < 10:
+            return {"status": "insufficient_data", "message": f"Only {total} complete records"}
+
+        acc = correct / total
+        return {
+            "status":               "calibrated",
+            "total_evaluated":      total,
+            "correctly_classified": correct,
+            "accuracy":             round(acc * 100, 1),
+            "interpretation": (
+                "Well calibrated"            if acc >= 0.70 else
+                "Moderately calibrated"      if acc >= 0.55 else
+                "Poorly calibrated — review model"
+            ),
+        }
 
 
-# ======================================================================
-# UTILITY FUNCTIONS
-# ======================================================================
+# ══════════════════════════════════════════════════════════════════
+# HELPER FUNCTIONS — read/write CSV records
+# ══════════════════════════════════════════════════════════════════
 
 def save_user_response(answers, total_score, prediction_result):
-    """Saves a single vendor submission to the local storage CSV."""
-    user_path = 'data/user_responses.csv'
+    """Save one vendor's survey answers to the local CSV log."""
+    path    = "data/user_responses.csv"
+    ts      = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    vid     = f"USER_{datetime.now().strftime('%Y%m%d%H%M%S')}"
 
-    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    vendor_id = f"USER_{timestamp.replace(':', '').replace(' ', '_').replace('-', '')}"
+    row = {"timestamp": ts, "vendor_id": vid, "data_source": "real",
+           **answers, "total_score": total_score, "survival_outcome": ""}
+    df_new = pd.DataFrame([row])
 
-    new_row = {
-        'timestamp':       timestamp,
-        'vendor_id':       vendor_id,
-        'data_source':     'real',
-        **answers,
-        'total_score':     total_score,
-        'survival_outcome': None
-    }
+    try:
+        if os.path.exists(path) and os.path.getsize(path) > 0:
+            df_old = pd.read_csv(path)
+            df_old["survival_outcome"] = df_old["survival_outcome"].fillna("").astype(str)
+            df_all = pd.concat([df_old, df_new], ignore_index=True)
+        else:
+            df_all = df_new
+        df_all["survival_outcome"] = df_all["survival_outcome"].fillna("").astype(str)
+        df_all.to_csv(path, index=False)
+    except PermissionError:
+        df_new.to_csv(f"data/user_responses_{vid}.csv", index=False)
 
-    df_new = pd.DataFrame([new_row])
-
-    if os.path.exists(user_path) and os.path.getsize(user_path) > 0:
-        df_existing = pd.read_csv(user_path)
-        df_combined = pd.concat([df_existing, df_new], ignore_index=True)
-    else:
-        df_combined = df_new
-
-    df_combined.to_csv(user_path, index=False)
-    return vendor_id
+    return vid
 
 
 def save_feedback(vendor_id, prediction, actual_outcome):
-    """Logs post-assessment outcomes for model retraining."""
-    feedback_path = 'data/feedback_data.csv'
-
-    new_row = {
-        'timestamp':             datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-        'vendor_id':             vendor_id,
-        'original_prediction':   prediction,
-        'actual_outcome':        actual_outcome,
-        'months_since_prediction': 'unknown'
+    """Log a verified 18-month outcome so the model can be retrained."""
+    path = "data/feedback_data.csv"
+    row  = {
+        "timestamp":               datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "vendor_id":               vendor_id,
+        "original_prediction":     prediction,
+        "actual_outcome":          actual_outcome,
+        "months_since_prediction": "unknown",
     }
+    df_new = pd.DataFrame([row])
+    try:
+        if os.path.exists(path) and os.path.getsize(path) > 0:
+            df_old = pd.read_csv(path)
+            df_all = pd.concat([df_old, df_new], ignore_index=True)
+        else:
+            df_all = df_new
+        df_all.to_csv(path, index=False)
+    except PermissionError:
+        df_new.to_csv(f"data/feedback_{vendor_id}.csv", index=False)
 
-    df_new = pd.DataFrame([new_row])
-
-    if os.path.exists(feedback_path) and os.path.getsize(feedback_path) > 0:
-        df_existing = pd.read_csv(feedback_path)
-        df_combined = pd.concat([df_existing, df_new], ignore_index=True)
-    else:
-        df_combined = df_new
-
-    df_combined.to_csv(feedback_path, index=False)
-    update_user_outcome(vendor_id, actual_outcome)
+    # Also stamp the outcome on the original response row
+    _stamp_outcome(vendor_id, actual_outcome)
 
 
-def update_user_outcome(vendor_id, outcome):
-    """Finds a specific record in user_responses.csv and stamps the outcome."""
-    user_path = 'data/user_responses.csv'
-    if os.path.exists(user_path):
-        df = pd.read_csv(user_path)
-        mask = df['vendor_id'] == vendor_id
+def _stamp_outcome(vendor_id, outcome):
+    """Write the actual outcome back into user_responses.csv."""
+    path = "data/user_responses.csv"
+    if not os.path.exists(path):
+        return
+    try:
+        df = pd.read_csv(path)
+        df["survival_outcome"] = df["survival_outcome"].fillna("").astype(str)
+        mask = df["vendor_id"] == vendor_id
         if mask.any():
-            if df['survival_outcome'].dtype != object:
-                df['survival_outcome'] = df['survival_outcome'].astype(object)
-            df.loc[mask, 'survival_outcome'] = outcome
-            df.to_csv(user_path, index=False)
+            df.loc[mask, "survival_outcome"] = outcome
+            df.to_csv(path, index=False)
+    except PermissionError:
+        pass
 
 
 def get_data_stats():
-    """Returns a summary of records currently on disk."""
-    stats = {
-        'mock_vendors':  0,
-        'real_users':    0,
-        'with_feedback': 0,
-        'total':         0
-    }
+    """Return simple counts of how many records exist in each file."""
+    stats = {"mock_vendors": 0, "real_users": 0, "with_feedback": 0, "total": 0}
 
-    mock_path     = 'data/mock_data.csv'
-    user_path     = 'data/user_responses.csv'
-    feedback_path = 'data/feedback_data.csv'
+    for path, key in [("data/mock_data.csv", "mock_vendors"),
+                      ("data/user_responses.csv", "real_users")]:
+        if os.path.exists(path):
+            try:
+                stats[key] = len(pd.read_csv(path))
+            except Exception:
+                pass
 
-    if os.path.exists(mock_path):
-        stats['mock_vendors'] = len(pd.read_csv(mock_path))
-
+    user_path = "data/user_responses.csv"
     if os.path.exists(user_path):
-        df_user = pd.read_csv(user_path)
-        stats['real_users'] = len(df_user)
-        if 'survival_outcome' in df_user.columns:
-            stats['with_feedback'] = int(df_user['survival_outcome'].notna().sum())
+        try:
+            df = pd.read_csv(user_path)
+            if "survival_outcome" in df.columns:
+                stats["with_feedback"] = int(df["survival_outcome"].isin(["Survived", "Failed"]).sum())
+        except Exception:
+            pass
 
-    if os.path.exists(feedback_path):
-        stats['feedback_entries'] = len(pd.read_csv(feedback_path))
-
-    stats['total'] = stats['mock_vendors'] + stats['real_users']
+    stats["total"] = stats["mock_vendors"] + stats["real_users"]
     return stats

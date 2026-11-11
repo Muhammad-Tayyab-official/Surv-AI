@@ -38,7 +38,7 @@ jobs:
         run: python generate_mock_data.py
 
       - name: Install Chromium
-        run: python -m playwright install --with-deps chromium
+        run: python -m playwright install chromium
 
       - name: Start SurvAI
         run: |
